@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<title>Configurable Equal-Step Keyboard</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; }
+  .row { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  #keys { display:grid; grid-template-columns: repeat(12, minmax(42px,1fr)); gap:6px; }
+  .key { user-select:none; padding:10px 6px; text-align:center; border:1px solid #bbb;
+         border-radius:6px; background:#f6f6f6; cursor:pointer; font-size:12px; }
+  .key.playing { background:#dfefff; border-color:#7aa7ff; }
+  .key.held    { background:#c9ffd7; border-color:#38a169; }
+  small { color:#555; }
+  kbd { padding:2px 4px; border:1px solid #ccc; border-bottom-width:2px; border-radius:4px; background:#fff; }
+  input[type="number"] { width: 110px; }
+  button { cursor:pointer; }
+</style>
+<body>
+  <div class="row">
+    <label>Base <input id="base" type="number" min="1" step="0.01" value="150"></label>
+    <label>Ratio <input id="ratio" type="number" min="0.000001" step="0.000001"></label>
+    <label>Keys <input id="keyCount" type="number" min="1" max="120" value="60"></label>
+    <button id="apply">Apply</button>
+    <button id="preset12">12-EDO</button>
+    <button id="preset30">30-EDT</button>
+    <label><input id="hold" type="checkbox"> Hold</label>
+    <button id="stopAll">Stop All</button>
+  </div>
+  <div class="row"><small id="status">…</small></div>
+  <div class="row">
+    <small>Typing: <kbd>[</kbd>/<kbd>]</kbd> ±12 • <kbd>-</kbd>/<kbd>=</kbd> ±1 • <kbd>Space</kbd> stop • (Disabled while editing inputs)</small>
+  </div>
+  <div id="keys" aria-label="Keyboard"></div>
+
+<script>
+(() => {
+  const audio = new (window.AudioContext || window.webkitAudioContext)();
+  function ensureAudio(){ if (audio.state !== 'running') audio.resume(); }
+
+  const baseEl   = document.getElementById('base');
+  const ratioEl  = document.getElementById('ratio');
+  const keyCntEl = document.getElementById('keyCount');
+  const applyBtn = document.getElementById('apply');
+  const preset12 = document.getElementById('preset12');
+  const preset30 = document.getElementById('preset30');
+  const holdEl   = document.getElementById('hold');
+  const stopAllBtn = document.getElementById('stopAll');
+  const statusEl = document.getElementById('status');
+  const keysEl   = document.getElementById('keys');
+
+  // layout for typing
+  const layout = [
+    '`','1','2','3','4','5','6','7','8','9','0','-','=',
+    'q','w','e','r','t','y','u','i','o','p','[',']','\\',
+    'a','s','d','f','g','h','j','k','l',';',"'", 
+    'z','x','c','v','b','n','m',',','.','/'
+  ];
+  const keyToIndex = new Map(layout.map((k,i)=>[k,i]));
+
+  // state
+  let BASE = 150;
+  let RATIO = Math.pow(3, 1/30);
+  ratioEl.value = RATIO.toFixed(6);
+  let KEYS = 60;
+  let transposeOffset = 0;
+  const active = new Map();
+  const pressed = new Set();
+
+  function isTyping() {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable || tag === 'SELECT';
+  }
+
+  function freqOf(n){ return BASE * Math.pow(RATIO, n); }
+  function updateStatus(){
+    const first = transposeOffset;
+    statusEl.textContent =
+      `Base: ${BASE.toFixed(4)} Hz • Ratio: ${RATIO.toFixed(6)} • Keys: ${KEYS} • Offset: ${transposeOffset} (n=${first} → ${freqOf(first).toFixed(2)} Hz)`;
+  }
+  function clampOffset(){
+    const maxStart = Math.max(0, KEYS - layout.length);
+    if (transposeOffset < 0) transposeOffset = 0;
+    if (transposeOffset > maxStart) transposeOffset = maxStart;
+    updateStatus();
+  }
+
+  function buildKeys(){
+    stopAll();
+    keysEl.innerHTML = '';
+    for (let n = 0; n < KEYS; n++) {
+      const f = freqOf(n);
+      const key = document.createElement('div');
+      key.className = 'key';
+      key.dataset.index = String(n);
+      key.title = `n=${n}\n${f.toFixed(2)} Hz`;
+      key.innerHTML = `<div>${n}</div><div>${f.toFixed(1)} Hz</div>`;
+      keysEl.appendChild(key);
+    }
+    clampOffset();
+  }
+
+  function markKey(n, cls, on){
+    const el = keysEl.children[n];
+    if (el) el.classList.toggle(cls, !!on);
+  }
+
+  function startNote(n){
+    if (n < 0 || n >= KEYS || active.has(n)) return;
+    ensureAudio();
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freqOf(n);
+    const now = audio.currentTime;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
+    osc.connect(gain).connect(audio.destination);
+    osc.start();
+    active.set(n, {osc, gain});
+    markKey(n, 'playing', true);
+  }
+
+  function stopNote(n){
+    const node = active.get(n); if (!node) return;
+    const {osc, gain} = node;
+    const now = audio.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value || 0.2, now);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+    osc.stop(now + 0.13);
+    active.delete(n);
+    markKey(n, 'playing', false);
+    markKey(n, 'held', false);
+  }
+
+  function stopAll(){ [...active.keys()].forEach(stopNote); }
+
+  // pointer
+  let dragging = false;
+  keysEl.addEventListener('pointerdown', e => {
+    const key = e.target.closest('.key'); if (!key) return;
+    dragging = true;
+    const n = Number(key.dataset.index);
+    if (holdEl.checked) {
+      if (active.has(n)) stopNote(n);
+      else { startNote(n); markKey(n, 'held', true); }
+    } else {
+      startNote(n);
+    }
+  });
+  keysEl.addEventListener('pointerover', e => {
+    if (!dragging || holdEl.checked) return;
+    const key = e.target.closest('.key'); if (!key) return;
+    const n = Number(key.dataset.index);
+    if (!active.has(n)) startNote(n);
+  });
+  window.addEventListener('pointerup', () => {
+    if (!dragging) return;
+    dragging = false;
+    if (!holdEl.checked) stopAll();
+  });
+  window.addEventListener('pointercancel', () => {
+    dragging = false;
+    if (!holdEl.checked) stopAll();
+  });
+
+  // keyboard mapping — disabled while typing in inputs/textareas/etc.
+  window.addEventListener('keydown', (e) => {
+    if (isTyping()) return;               // <-- key fix
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+
+    if (k === '['){ transposeOffset -= 12; clampOffset(); e.preventDefault(); return; }
+    if (k === ']'){ transposeOffset += 12; clampOffset(); e.preventDefault(); return; }
+    if (k === '-') { transposeOffset -= 1; clampOffset(); e.preventDefault(); return; }
+    if (k === '=') { transposeOffset += 1; clampOffset(); e.preventDefault(); return; }
+    if (k === ' ') { stopAll(); e.preventDefault(); return; }
+
+    if (keyToIndex.has(k)) {
+      const n = keyToIndex.get(k) + transposeOffset;
+      if (holdEl.checked) {
+        if (active.has(n)) stopNote(n);
+        else { startNote(n); markKey(n, 'held', true); }
+      } else {
+        startNote(n);
+      }
+      e.preventDefault();
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    if (isTyping()) return;               // <-- key fix
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (!holdEl.checked && keyToIndex.has(k)) {
+      const n = keyToIndex.get(k) + transposeOffset;
+      stopNote(n);
+      e.preventDefault();
+    }
+  });
+
+  // settings
+  function applySettings(){
+    const b = Number(baseEl.value);
+    const r = Number(ratioEl.value);
+    const k = Number(keyCntEl.value);
+    if (!(b > 0)) { alert('Base must be > 0'); return; }
+    if (!(r > 0)) { alert('Ratio must be > 0'); return; }
+    if (!(Number.isFinite(k) && k >= 1 && k <= 120)) { alert('Keys must be 1–120'); return; }
+    BASE = b; RATIO = r; KEYS = Math.floor(k);
+    if (transposeOffset > Math.max(0, KEYS - layout.length)) transposeOffset = 0;
+    buildKeys(); updateStatus();
+  }
+
+  preset12.addEventListener('click', () => { ratioEl.value = Math.pow(2, 1/12).toFixed(6); });
+  preset30.addEventListener('click', () => { ratioEl.value = Math.pow(3, 1/30).toFixed(6); });
+  applyBtn.addEventListener('click', applySettings);
+  stopAllBtn.addEventListener('click', stopAll);
+
+  // init
+  buildKeys(); updateStatus();
+})();
+</script>
+</body>
+</html>
