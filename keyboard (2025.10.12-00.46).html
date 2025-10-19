@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<title>Configurable Equal-Step Keyboard (Presets + Formula Inputs + Save/Delete Custom)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; }
+  .row { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  #keys { display:grid; grid-template-columns: repeat(12, minmax(42px,1fr)); gap:6px; }
+  .key { user-select:none; padding:10px 6px; text-align:center; border:1px solid #bbb;
+         border-radius:6px; background:#f6f6f6; cursor:pointer; font-size:12px; }
+  .key.playing { background:#dfefff; border-color:#7aa7ff; }
+  .key.held    { background:#c9ffd7; border-color:#38a169; }
+  small { color:#555; }
+  kbd { padding:2px 4px; border:1px solid #ccc; border-bottom-width:2px; border-radius:4px; background:#fff; }
+  input[type="text"], input[type="number"] { width: 130px; }
+  select { padding: 4px 6px; }
+  button { cursor:pointer; }
+</style>
+<body>
+  <div class="row">
+    <label>Preset
+      <select id="presetSelect">
+        <option value="">— Choose preset —</option>
+      </select>
+    </label>
+
+    <button id="savePreset">💾 Save Preset</button>
+    <button id="deletePreset" style="display:none;">🗑️ Delete Preset</button>
+
+    <label>Base
+      <input id="base" type="text" value="150">
+    </label>
+
+    <label>Ratio
+      <input id="ratio" type="text" value="">
+    </label>
+
+    <label>Keys
+      <input id="keyCount" type="number" min="1" max="120" value="60">
+    </label>
+
+    <button id="apply">Apply</button>
+    <label><input id="hold" type="checkbox"> Hold</label>
+    <button id="stopAll">Stop All</button>
+  </div>
+
+  <div class="row">
+    <small id="status">…</small>
+  </div>
+  <div class="row">
+    <small>Typing: <kbd>[</kbd>/<kbd>]</kbd> ±12 • <kbd>-</kbd>/<kbd>=</kbd> ±1 • <kbd>Space</kbd> stop • (Disabled while editing inputs)</small>
+  </div>
+
+  <div id="keys" aria-label="Keyboard"></div>
+
+<script>
+(() => {
+  // ---------- Audio ----------
+  const audio = new (window.AudioContext || window.webkitAudioContext)();
+  function ensureAudio(){ if (audio.state !== 'running') audio.resume(); }
+
+  // ---------- DOM ----------
+  const presetSelect = document.getElementById('presetSelect');
+  const savePresetBtn = document.getElementById('savePreset');
+  const deletePresetBtn = document.getElementById('deletePreset');
+  const baseEl   = document.getElementById('base');
+  const ratioEl  = document.getElementById('ratio');
+  const keyCntEl = document.getElementById('keyCount');
+  const applyBtn = document.getElementById('apply');
+  const holdEl   = document.getElementById('hold');
+  const stopAllBtn = document.getElementById('stopAll');
+  const statusEl = document.getElementById('status');
+  const keysEl   = document.getElementById('keys');
+
+  // ---------- Keyboard layout for typing (row-wrapped) ----------
+  const rows = [
+    ['1','2','3','4','5','6','7','8','9','0'],
+    ['q','w','e','r','t','y','u','i','o','p'],
+    ['a','s','d','f','g','h','j','k','l',';'],
+    ['z','x','c','v','b','n','m',',','.','/']
+  ];
+  const layout = rows.flat();
+  const keyToIndex = new Map(layout.map((k,i)=>[k,i]));
+
+  // ---------- State ----------
+  let BASE = 150;
+  let RATIO = Math.pow(3, 1/30);
+  ratioEl.value = RATIO.toPrecision(8);
+  let KEYS = 60;
+  let transposeOffset = 0;
+  const active = new Map();
+  const pressed = new Set();
+
+  // ---------- Expression parser ----------
+  function parseExpr(str) {
+    if (typeof str !== 'string') return NaN;
+    let s = str.trim().toLowerCase();
+    s = s.replace(/\^/g, '**')
+         .replace(/\bpi\b/g, 'Math.PI')
+         .replace(/\be\b/g, 'Math.E')
+         .replace(/\bsqrt\s*\(/g, 'Math.sqrt(')
+         .replace(/\bln\s*\(/g, 'Math.log(')
+         .replace(/\blog\s*\(/g, 'Math.log10(')
+         .replace(/\bpow\s*\(/g, 'Math.pow(');
+    if (!/^[\d+\-*/()., \t\nrMathEPIlogsqrtpow**]+$/i.test(s)) return NaN;
+    try {
+      const val = Function('"use strict"; return (' + s + ')')();
+      return Number.isFinite(val) ? val : NaN;
+    } catch {
+      return NaN;
+    }
+  }
+
+  function readNumberField(el, {allowExpr=false} = {}) {
+    const raw = el.value.trim();
+    if (!allowExpr) {
+      const v = Number(raw);
+      return Number.isFinite(v) ? v : NaN;
+    } else {
+      const v = parseExpr(raw);
+      if (Number.isFinite(v)) return v;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : NaN;
+    }
+  }
+
+  function isTyping() {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable || tag === 'SELECT';
+  }
+
+  // ---------- Frequency / UI ----------
+  function freqOf(n){ return BASE * Math.pow(RATIO, n); }
+  function updateStatus(){
+    const first = transposeOffset;
+    statusEl.textContent =
+      `Base: ${BASE.toFixed(6)} Hz • Ratio: ${RATIO.toPrecision(8)} • Keys: ${KEYS} • `
+      + `Offset: ${transposeOffset} (n=${first} → ${freqOf(first).toFixed(3)} Hz)`;
+  }
+
+  function clampOffset(){
+    const maxStart = Math.max(0, KEYS - layout.length);
+    if (transposeOffset < 0) transposeOffset = 0;
+    if (transposeOffset > maxStart) transposeOffset = maxStart;
+    updateStatus();
+  }
+
+  function buildKeys(){
+    stopAll();
+    keysEl.innerHTML = '';
+    for (let n = 0; n < KEYS; n++) {
+      const f = freqOf(n);
+      const key = document.createElement('div');
+      key.className = 'key';
+      key.dataset.index = String(n);
+      key.title = `n=${n}\n${f.toFixed(3)} Hz`;
+      key.innerHTML = `<div>${n}</div><div>${f.toFixed(2)} Hz</div>`;
+      keysEl.appendChild(key);
+    }
+    clampOffset();
+  }
+
+  function markKey(n, cls, on){
+    const el = keysEl.children[n];
+    if (el) el.classList.toggle(cls, !!on);
+  }
+
+  function startNote(n){
+    if (n < 0 || n >= KEYS || active.has(n)) return;
+    ensureAudio();
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freqOf(n);
+    const now = audio.currentTime;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
+    osc.connect(gain).connect(audio.destination);
+    osc.start();
+    active.set(n, {osc, gain});
+    markKey(n, 'playing', true);
+  }
+
+  function stopNote(n){
+    const node = active.get(n); if (!node) return;
+    const {osc, gain} = node;
+    const now = audio.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value || 0.2, now);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+    osc.stop(now + 0.13);
+    active.delete(n);
+    markKey(n, 'playing', false);
+    markKey(n, 'held', false);
+  }
+
+  function stopAll(){ [...active.keys()].forEach(stopNote); }
+
+  // ---------- Pointer ----------
+  let dragging = false;
+  keysEl.addEventListener('pointerdown', e => {
+    const key = e.target.closest('.key'); if (!key) return;
+    dragging = true;
+    const n = Number(key.dataset.index);
+    if (holdEl.checked) {
+      if (active.has(n)) stopNote(n);
+      else { startNote(n); markKey(n, 'held', true); }
+    } else {
+      startNote(n);
+    }
+  });
+  keysEl.addEventListener('pointerover', e => {
+    if (!dragging || holdEl.checked) return;
+    const key = e.target.closest('.key'); if (!key) return;
+    const n = Number(key.dataset.index);
+    if (!active.has(n)) startNote(n);
+  });
+  window.addEventListener('pointerup', () => {
+    if (!dragging) return;
+    dragging = false;
+    if (!holdEl.checked) stopAll();
+  });
+  window.addEventListener('pointercancel', () => {
+    dragging = false;
+    if (!holdEl.checked) stopAll();
+  });
+
+  // ---------- Computer keyboard mapping ----------
+  window.addEventListener('keydown', (e) => {
+    if (isTyping()) return;
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+
+    if (k === '['){ transposeOffset -= 12; clampOffset(); e.preventDefault(); return; }
+    if (k === ']'){ transposeOffset += 12; clampOffset(); e.preventDefault(); return; }
+    if (k === '-') { transposeOffset -= 1; clampOffset(); e.preventDefault(); return; }
+    if (k === '=') { transposeOffset += 1; clampOffset(); e.preventDefault(); return; }
+    if (k === ' ') { stopAll(); e.preventDefault(); return; }
+
+    if (pressed.has(k)) return;
+    pressed.add(k);
+
+    if (keyToIndex.has(k)) {
+      const n = keyToIndex.get(k) + transposeOffset;
+      if (holdEl.checked) {
+        if (active.has(n)) stopNote(n);
+        else { startNote(n); markKey(n, 'held', true); }
+      } else {
+        startNote(n);
+      }
+      e.preventDefault();
+    }
+  });
+
+  window.addEventListener('keyup', (e) => {
+    if (isTyping()) return;
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    pressed.delete(k);
+    if (!holdEl.checked && keyToIndex.has(k)) {
+      const n = keyToIndex.get(k) + transposeOffset;
+      stopNote(n);
+      e.preventDefault();
+    }
+  });
+
+  // ---------- Presets ----------
+  const BUILTIN_PRESETS = {
+    "12-EDO":       { ratio: Math.pow(2, 1/12) },
+    "19-EDO":       { ratio: Math.pow(2, 1/19) },
+    "24-EDO":       { ratio: Math.pow(2, 1/24) },
+    "30-EDT":       { ratio: Math.pow(3, 1/30) },
+    "31-EDO":       { ratio: Math.pow(2, 1/31) },
+    "53-EDO":       { ratio: Math.pow(2, 1/53) },
+    "BP-13":        { ratio: Math.pow(3, 1/13) },
+    "ED-fifth-9":   { ratio: Math.pow(3/2, 1/9) },
+    "ED-fifth-12":  { ratio: Math.pow(3/2, 1/12) },
+  };
+
+  const CUSTOM_STORE_KEY = 'eqstep_custom_presets_v1';
+  function loadCustomPresets(){
+    try { const raw = localStorage.getItem(CUSTOM_STORE_KEY);
+      return raw ? JSON.parse(raw) : {}; } catch { return {}; }
+  }
+  function saveCustomPresets(obj){
+    try { localStorage.setItem(CUSTOM_STORE_KEY, JSON.stringify(obj)); } catch {}
+  }
+
+  let customPresets = loadCustomPresets();
+  let ogBuiltIn, ogCustom;
+  function rebuildPresetDropdown(selectedValue = ''){
+    while (presetSelect.options.length > 1) presetSelect.remove(1);
+    ogBuiltIn = document.createElement('optgroup'); ogBuiltIn.label = 'Built-in';
+    presetSelect.appendChild(ogBuiltIn);
+    for (const name of Object.keys(BUILTIN_PRESETS)) {
+      const opt = document.createElement('option');
+      opt.value = 'builtin::' + name; opt.textContent = name;
+      ogBuiltIn.appendChild(opt);
+    }
+    const customNames = Object.keys(customPresets);
+    if (customNames.length) {
+      ogCustom = document.createElement('optgroup');
+      ogCustom.label = 'Custom'; presetSelect.appendChild(ogCustom);
+      for (const name of customNames) {
+        const opt = document.createElement('option');
+        opt.value = 'custom::' + name; opt.textContent = name;
+        ogCustom.appendChild(opt);
+      }
+    }
+    if (selectedValue) {
+      const opt = [...presetSelect.options].find(o => o.value === selectedValue);
+      if (opt) presetSelect.value = selectedValue;
+    }
+  }
+
+  function setPresetByValue(value){
+    const [kind, name] = value.split('::');
+    if (kind === 'builtin') {
+      const p = BUILTIN_PRESETS[name]; if (!p) return;
+      if (p.base) baseEl.value = p.base.toString();
+      ratioEl.value = p.ratio.toPrecision(8);
+      if (p.keys) keyCntEl.value = p.keys;
+      applySettings();
+    } else if (kind === 'custom') {
+      const p = customPresets[name]; if (!p) return;
+      baseEl.value  = Number(p.base).toPrecision(8);
+      ratioEl.value = Number(p.ratio).toPrecision(8);
+      if (p.keys) keyCntEl.value = p.keys;
+      applySettings();
+    }
+  }
+
+  presetSelect.addEventListener('change', () => {
+    const v = presetSelect.value;
+    if (v) setPresetByValue(v);
+    deletePresetBtn.style.display = v.startsWith('custom::') ? 'inline-block' : 'none';
+  });
+
+  // --- Save custom preset ---
+  savePresetBtn.addEventListener('click', () => {
+    const name = (prompt('Name for this preset (1–32 chars: letters, numbers, spaces, - or _):', 'My Preset') || '').trim();
+    if (!name) return;
+    if (!/^[\w -]{1,32}$/.test(name)) { alert('Invalid name.'); return; }
+    if (Object.prototype.hasOwnProperty.call(BUILTIN_PRESETS, name)) { alert('Reserved name.'); return; }
+
+    const b = readNumberField(baseEl,  {allowExpr:true});
+    const r = readNumberField(ratioEl, {allowExpr:true});
+    const k = Number(keyCntEl.value);
+    if (!(b > 0) || !(r > 0) || !(Number.isFinite(k) && k >= 1 && k <= 120)) { alert('Invalid values.'); return; }
+
+    if (customPresets[name] && !confirm(`Overwrite preset "${name}"?`)) return;
+    customPresets[name] = { base: b, ratio: r, keys: Math.floor(k), savedAt: Date.now() };
+    saveCustomPresets(customPresets);
+    const value = 'custom::' + name;
+    rebuildPresetDropdown(value);
+    setPresetByValue(value);
+  });
+
+  // --- Delete custom preset ---
+  deletePresetBtn.addEventListener('click', () => {
+    const v = presetSelect.value;
+    if (!v.startsWith('custom::')) { alert('Select a custom preset to delete.'); return; }
+    const name = v.split('::')[1];
+    if (!customPresets[name]) { alert('Preset not found.'); return; }
+    if (!confirm(`Delete custom preset "${name}"?`)) return;
+    delete customPresets[name];
+    saveCustomPresets(customPresets);
+    rebuildPresetDropdown('');
+    presetSelect.value = '';
+    deletePresetBtn.style.display = 'none';
+    alert(`Preset "${name}" deleted.`);
+  });
+
+  // ---------- Settings ----------
+  function applySettings(){
+    const b = readNumberField(baseEl,  {allowExpr:true});
+    const r = readNumberField(ratioEl, {allowExpr:true});
+    const k = Number(keyCntEl.value);
+    if (!(b > 0) || !(r > 0) || !(Number.isFinite(k) && k >= 1 && k <= 120)) return;
+    BASE = b; RATIO = r; KEYS = Math.floor(k);
+    baseEl.value  = BASE.toPrecision(8);
+    ratioEl.value = RATIO.toPrecision(8);
+    if (transposeOffset > Math.max(0, KEYS - layout.length)) transposeOffset = 0;
+    buildKeys(); updateStatus();
+  }
+
+  applyBtn.addEventListener('click', applySettings);
+  stopAllBtn.addEventListener('click', stopAll);
+
+  // ---------- Init ----------
+  rebuildPresetDropdown();
+  buildKeys();
+  updateStatus();
+})();
+</script>
+</body>
+</html>
