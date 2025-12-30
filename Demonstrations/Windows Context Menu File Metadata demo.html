@@ -1,28 +1,30 @@
- <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
-<meta charset="UTF-8">
-<title>Windows Context Menu File Metadata demo</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="stylesheet" href="">
-<script src=""></script>
+<head>
+  <meta charset="UTF-8">
+  <title>Windows Context Menu File Metadata Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <style>
+    .video-container {
+      max-width: 800px;
+      margin: auto;
+    }
+    .video-container video {
+      width: 100%;
+      height: auto;
+    }
+  </style>
+</head>
+
 <body>
-<style>
-.video-container {
-  max-width: 100%;
-}
-.video-container video {
-  width: 100%;
-  height: auto;
-}
-</style>
 
-<div class="video-container">
-  <video controls width="800" autoplay>
-    <source src="https://raw.githubusercontent.com/Hypercub3/Windows-Shell-Utilities/42653ef8b452782e1492efc875b764d240518e3a/Windows%20Context%20Menu%20File%20Metadata/Demonstration.mp4" type="video/mp4">
-  </video>
-</div>
-
-</div>
+  <div class="video-container">
+    <video controls autoplay playsinline>
+      <source src="https://raw.githubusercontent.com/Hypercub3/Windows-Shell-Utilities/42653ef8b452782e1492efc875b764d240518e3a/Windows%20Context%20Menu%20File%20Metadata/Demonstration.mp4" type="video/mp4">
+      Your browser does not support the video tag.
+    </video>
+  </div>
 
 </body>
-</html> 
+</html>
